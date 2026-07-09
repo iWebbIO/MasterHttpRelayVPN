@@ -6,7 +6,7 @@ Traffic path:
 
 Browser -> Local Proxy -> Apps Script -> Exit Node -> Target Website
 
-Use this when destinations block Google datacenter egress.
+Use this when destinations block Google datacenter egress, or when you want to route standard HTTPS traffic transparently without requiring local MITM (VPS only).
 
 ## 1) Choose One Provider
 

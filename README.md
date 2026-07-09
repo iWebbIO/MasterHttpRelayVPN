@@ -16,9 +16,9 @@
 
 **❤️ Special Thanks to** [Abolix](https://github.com/abolix) for making this project possible and maintaining it.
 
-MasterHttpRelayVPN is a local proxy that routes browser traffic through a Google Apps Script relay using domain fronting. The simple path needs only this project and a free Google account. For sites that block Google egress, you can optionally add an exit node later.
+MasterHttpRelayVPN is a local proxy that routes browser traffic through a Google Apps Script relay using domain fronting. The simple path needs only this project and a free Google account. For sites that block Google egress (or for users who want to proxy HTTPS without MITM), you can optionally add an exit node later.
 
-We mainly use MITM (Man in the Middle) and Domain Fronting techniques.
+We mainly use MITM (Man in the Middle) and Domain Fronting techniques, though configuring a VPS exit node unlocks the ability to route HTTPS traffic via transparent TCP tunneling without any MITM.
 
 ```text
 Browser -> Local proxy -> Google front -> Your Apps Script relay -> Target site

@@ -34,7 +34,7 @@ The network sees a Google-facing connection. The relay request carries the real 
 ## Request Handling
 
 1. The browser sends HTTP or HTTPS proxy traffic to `127.0.0.1:8085`.
-2. For HTTPS, the proxy can perform local MITM using the generated CA.
+2. For HTTPS, the proxy can perform local MITM using the generated CA, or establish a transparent TCP tunnel (no MITM) if a VPS exit node is configured.
 3. Host rules decide whether traffic is direct, blocked, bypassed, or relayed.
 4. Relayed requests are encoded as JSON for Apps Script.
 5. Apps Script fetches the destination and returns a serialized HTTP response.
