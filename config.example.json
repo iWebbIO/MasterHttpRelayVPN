@@ -46,6 +46,10 @@
 		"hosts": [
 			".chatgpt.com",
 			".openai.com"
+		],
+		"tcp_tunnel_hosts": [
+			".banking.example.com",
+			"strict-corp-portal.com"
 		]
 	},
 	"log_level": "INFO",

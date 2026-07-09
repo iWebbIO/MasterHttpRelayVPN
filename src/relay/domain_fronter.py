@@ -341,10 +341,13 @@ class DomainFronter:
         if self._exit_node_mode not in ("full", "selective"):
             self._exit_node_mode = "selective"
         self._exit_node_hosts: frozenset[str] = frozenset(
-            str(h).lower().strip().lstrip(".")
-            for h in (en_cfg.get("hosts") or [])
-            if h
+            str(x).lower() for x in en_cfg.get("hosts", []) if x
         )
+        self._exit_node_tcp_tunnel_hosts: frozenset[str] = frozenset(
+            str(x).lower() for x in en_cfg.get("tcp_tunnel_hosts", []) if x
+        )
+        self._active_tcp_tunnels = 0
+        self._max_tcp_tunnels = 20
         if self._exit_node_enabled and self._exit_node_url:
             log.info(
                 "Exit node enabled [mode=%s, provider=%s]: %s",
@@ -1532,6 +1535,18 @@ class DomainFronter:
                 return True
         return False
 
+    def should_use_tcp_tunnel(self, host: str) -> bool:
+        """Check if the host is allowed to use the transparent TCP tunnel."""
+        if not self._exit_node_enabled or not self._exit_node_url:
+            return False
+        if "*" in self._exit_node_tcp_tunnel_hosts:
+            return True
+        host = host.lower()
+        for pattern in self._exit_node_tcp_tunnel_hosts:
+            if host == pattern or host.endswith(pattern):
+                return True
+        return False
+
     async def _relay_via_exit_node(self, payload: dict) -> bytes:
         """Chain: Apps Script → edge relay (exit node) → Destination.
 
@@ -1628,71 +1643,94 @@ class DomainFronter:
         if not self._exit_node_enabled or not self._exit_node_url:
             return False
 
-        import uuid
-        session_id = uuid.uuid4().hex
-        log.info("TCP tunnel via Apps Script → %s:%d (session %s)", host, port, session_id[:8])
-        
-        # Explicitly connect first to avoid the race condition
-        resp = await self._send_tcp_tunnel_action(session_id, "connect", host, port, b"")
-        if resp.get("closed") or resp.get("e"):
-            log.warning("TCP tunnel connect failed: %s", resp.get("e"))
+        if self._active_tcp_tunnels >= self._max_tcp_tunnels:
+            log.warning("TCP tunnel concurrency limit reached (%d), falling back to MITM", self._active_tcp_tunnels)
             return False
 
-        async def upload_task():
-            errors = 0
-            try:
-                while True:
-                    data = await reader.read(65536)
-                    if not data and reader.at_eof():
-                        await self._send_tcp_tunnel_action(session_id, "close", host, port, b"")
-                        break
-                        
-                    resp = await self._send_tcp_tunnel_action(session_id, "send", host, port, data)
-                    if not resp:
-                        errors += 1
-                        if errors > 3:
-                            break
-                    else:
-                        errors = 0
-                        
-                    if resp.get("closed"):
-                        writer.close()
-                        break
-            except Exception as e:
-                log.debug("TCP upload_task ended: %s", e)
-                
-        async def download_task():
-            errors = 0
-            try:
-                while True:
-                    resp = await self._send_tcp_tunnel_action(session_id, "poll", host, port, b"")
-                    if not resp:
-                        errors += 1
-                        if errors > 3:
-                            break
-                        await asyncio.sleep(1.0)  # Backoff on error
-                        continue
-                    else:
-                        errors = 0
-
-                    if resp.get("b"):
-                        writer.write(base64.b64decode(resp["b"]))
-                        await writer.drain()
-                    if resp.get("closed"):
+        import time
+        import uuid
+        
+        self._active_tcp_tunnels += 1
+        try:
+            session_id = uuid.uuid4().hex
+            log.info("TCP tunnel via Apps Script → %s:%d (session %s)", host, port, session_id[:8])
+            
+            # Explicitly connect first to avoid the race condition
+            resp = await self._send_tcp_tunnel_action(session_id, "connect", host, port, b"")
+            if resp.get("closed") or resp.get("e"):
+                log.warning("TCP tunnel connect failed: %s", resp.get("e"))
+                return False
+    
+            last_active = [time.time()]  # mutable list for closure
+            
+            async def upload_task():
+                errors = 0
+                try:
+                    while True:
                         try:
-                            writer.write_eof()
-                        except Exception:
+                            data = await asyncio.wait_for(reader.read(65536), timeout=15.0)
+                        except asyncio.TimeoutError:
+                            if time.time() - last_active[0] > 120:
+                                log.info("TCP tunnel %s idle timeout (120s)", session_id[:8])
+                                await self._send_tcp_tunnel_action(session_id, "close", host, port, b"")
+                                break
+                            continue
+                            
+                        if not data and reader.at_eof():
+                            await self._send_tcp_tunnel_action(session_id, "close", host, port, b"")
+                            break
+                            
+                        last_active[0] = time.time()
+                            
+                        resp = await self._send_tcp_tunnel_action(session_id, "send", host, port, data)
+                        if not resp:
+                            errors += 1
+                            if errors > 3:
+                                break
+                        else:
+                            errors = 0
+                            
+                        if resp.get("closed"):
                             writer.close()
-                        break
-            except Exception as e:
-                log.debug("TCP download_task ended: %s", e)
-                
-        t1 = asyncio.create_task(upload_task())
-        t2 = asyncio.create_task(download_task())
-        await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-        t1.cancel()
-        t2.cancel()
-        return True
+                            break
+                except Exception as e:
+                    log.debug("TCP upload_task ended: %s", e)
+                    
+            async def download_task():
+                errors = 0
+                try:
+                    while True:
+                        resp = await self._send_tcp_tunnel_action(session_id, "poll", host, port, b"")
+                        if not resp:
+                            errors += 1
+                            if errors > 3:
+                                break
+                            await asyncio.sleep(1.0)  # Backoff on error
+                            continue
+                        else:
+                            errors = 0
+    
+                        if resp.get("b"):
+                            last_active[0] = time.time()
+                            writer.write(base64.b64decode(resp["b"]))
+                            await writer.drain()
+                        if resp.get("closed"):
+                            try:
+                                writer.write_eof()
+                            except Exception:
+                                writer.close()
+                            break
+                except Exception as e:
+                    log.debug("TCP download_task ended: %s", e)
+                    
+                t1 = asyncio.create_task(upload_task())
+                t2 = asyncio.create_task(download_task())
+                await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+                t1.cancel()
+                t2.cancel()
+                return True
+        finally:
+            self._active_tcp_tunnels -= 1
 
     # ── Apps Script relay (apps_script mode) ──────────────────────
 

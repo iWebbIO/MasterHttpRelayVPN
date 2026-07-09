@@ -585,7 +585,7 @@ class ProxyServer:
         # Keep non-HTTP ports on direct tunnel because they cannot be relayed.
         if is_ip_literal(host):
             if port == 443:
-                if self.fronter._exit_node_enabled and self.fronter._exit_node_url:
+                if self.fronter.should_use_tcp_tunnel(host):
                     ok = await self.fronter.relay_tcp_tunnel(host, port, reader, writer)
                     if not ok:
                         await self._do_mitm_connect(host, port, reader, writer)
@@ -632,7 +632,7 @@ class ProxyServer:
             else:
                 await self._do_plain_http_tunnel(host, port, reader, writer)
         elif port == 443:
-            if self.fronter._exit_node_enabled and self.fronter._exit_node_url:
+            if self.fronter.should_use_tcp_tunnel(host):
                 ok = await self.fronter.relay_tcp_tunnel(host, port, reader, writer)
                 if not ok:
                     await self._do_mitm_connect(host, port, reader, writer)
