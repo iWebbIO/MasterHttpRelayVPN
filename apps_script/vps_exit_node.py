@@ -34,10 +34,15 @@ import json
 import logging
 import os
 import re
+import select
+import socket
 import socketserver
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
+import uuid
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -111,6 +116,27 @@ for _h in (
 del _h
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TCP Tunnel Sessions (for proxying raw TCP streams over HTTP)
+# ---------------------------------------------------------------------------
+
+_TCP_SESSIONS: dict[str, dict] = {}
+_TCP_LOCK = threading.Lock()
+
+
+def _cleanup_tcp_sessions():
+    """Remove inactive TCP sessions to prevent leaks."""
+    now = time.time()
+    with _TCP_LOCK:
+        for sid, sess in list(_TCP_SESSIONS.items()):
+            if now - sess["last_active"] > 300:  # 5 minutes idle
+                try:
+                    sess["sock"].close()
+                except Exception:
+                    pass
+                del _TCP_SESSIONS[sid]
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -130,8 +156,8 @@ def _sanitize_headers(raw: object) -> dict[str, str]:
 
 
 def _safe_url(url: str) -> bool:
-    """Return True only for plain http:// or https:// URLs (no localhost / LAN)."""
-    if not re.match(r"^https?://", url, re.IGNORECASE):
+    """Return True only for plain http://, https://, or tcp:// URLs (no localhost / LAN)."""
+    if not re.match(r"^(https?|tcp)://", url, re.IGNORECASE):
         return False
     # Block requests to loopback / private addresses to prevent SSRF.
     from urllib.parse import urlparse
@@ -287,6 +313,14 @@ class _ExitNodeHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(400, {"e": "bad_base64"})
                 return
 
+        _cleanup_tcp_sessions()
+
+        if u.startswith("tcp://") or u.startswith("TCP://"):
+            log.debug("TCP Tunnel %s %s", m, u[:100])
+            result = self._handle_tcp_tunnel(u, h, payload_bytes)
+            self._send_json(200, result)
+            return
+
         log.info("Relaying %s %s", m, u[:100])
         try:
             result = _relay_request(u, m, h, payload_bytes)
@@ -297,6 +331,78 @@ class _ExitNodeHandler(http.server.BaseHTTPRequestHandler):
 
         log.info("Relay OK %s → HTTP %d (%d B)", u[:80], result["s"], len(result.get("b", "")))
         self._send_json(200, result)
+
+    def _close_tcp_session(self, session_id: str) -> None:
+        with _TCP_LOCK:
+            session = _TCP_SESSIONS.pop(session_id, None)
+        if session:
+            try:
+                session["sock"].close()
+            except Exception:
+                pass
+
+    def _handle_tcp_tunnel(self, url: str, headers: dict[str, str], payload_bytes: bytes) -> dict:
+        from urllib.parse import urlparse
+        
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 443
+        
+        action = headers.get("x-tcp-action", "poll")
+        session_id = headers.get("x-tcp-session", "")
+        
+        if action == "connect":
+            if not session_id:
+                session_id = uuid.uuid4().hex
+            try:
+                sock = socket.create_connection((host, port), timeout=10.0)
+                sock.setblocking(False)
+                with _TCP_LOCK:
+                    _TCP_SESSIONS[session_id] = {"sock": sock, "last_active": time.time()}
+            except Exception as e:
+                return {"s": 502, "e": f"connect_failed: {e}", "closed": True}
+            return {"s": 200, "session": session_id}
+            
+        with _TCP_LOCK:
+            session = _TCP_SESSIONS.get(session_id)
+            
+        if not session:
+            return {"s": 404, "e": "session_not_found", "closed": True}
+            
+        sock = session["sock"]
+        session["last_active"] = time.time()
+        
+        if action == "close":
+            self._close_tcp_session(session_id)
+            return {"s": 200, "closed": True}
+            
+        if action == "send":
+            if payload_bytes:
+                try:
+                    sock.setblocking(True)
+                    sock.sendall(payload_bytes)
+                    sock.setblocking(False)
+                except Exception as e:
+                    self._close_tcp_session(session_id)
+                    return {"s": 502, "e": f"send_failed: {e}", "closed": True}
+            return {"s": 200}
+            
+        if action == "poll":
+            try:
+                r, _, _ = select.select([sock], [], [], 15.0)
+                if r:
+                    data = sock.recv(_MAX_RESPONSE_BODY)
+                    if not data:
+                        self._close_tcp_session(session_id)
+                        return {"s": 200, "closed": True, "b": ""}
+                    return {"s": 200, "b": base64.b64encode(data).decode()}
+                else:
+                    return {"s": 200, "b": ""}
+            except Exception as e:
+                self._close_tcp_session(session_id)
+                return {"s": 502, "e": f"poll_failed: {e}", "closed": True}
+                
+        return {"s": 400, "e": "invalid_action"}
 
 
 # ---------------------------------------------------------------------------

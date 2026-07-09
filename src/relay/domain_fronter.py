@@ -1589,6 +1589,111 @@ class DomainFronter:
         log.debug("Exit node relay OK: %s", payload.get("u", "")[:80])
         return result
 
+    async def _send_tcp_tunnel_action(self, session_id: str, action: str,
+                                      host: str, port: int, payload: bytes) -> dict:
+        inner = {
+            "u": f"tcp://{host}:{port}",
+            "m": "POST",
+            "h": {
+                "x-tcp-action": action,
+                "x-tcp-session": session_id,
+            },
+            "k": self._exit_node_psk
+        }
+        if payload:
+            inner["b"] = base64.b64encode(payload).decode()
+            
+        inner_json = json.dumps(inner).encode()
+        outer = self._build_payload(
+            "POST",
+            self._exit_node_url,
+            {"Content-Type": "application/json"},
+            inner_json,
+        )
+        outer["ct"] = "application/json"
+        
+        try:
+            # Use _relay_single to bypass batching and reduce latency for TCP streams.
+            raw = await self._relay_single(outer)
+            _, _, vps_relay_bytes = split_raw_response(raw)
+            return json.loads(vps_relay_bytes)
+        except Exception as e:
+            log.debug("TCP tunnel %s error: %s", action, e)
+            return {}
+
+    async def relay_tcp_tunnel(self, host: str, port: int,
+                               reader: asyncio.StreamReader,
+                               writer: asyncio.StreamWriter) -> bool:
+        """Tunnel a raw TCP connection over HTTP POST polling to the VPS exit node."""
+        if not self._exit_node_enabled or not self._exit_node_url:
+            return False
+
+        import uuid
+        session_id = uuid.uuid4().hex
+        log.info("TCP tunnel via Apps Script → %s:%d (session %s)", host, port, session_id[:8])
+        
+        # Explicitly connect first to avoid the race condition
+        resp = await self._send_tcp_tunnel_action(session_id, "connect", host, port, b"")
+        if resp.get("closed") or resp.get("e"):
+            log.warning("TCP tunnel connect failed: %s", resp.get("e"))
+            return False
+
+        async def upload_task():
+            errors = 0
+            try:
+                while True:
+                    data = await reader.read(65536)
+                    if not data and reader.at_eof():
+                        await self._send_tcp_tunnel_action(session_id, "close", host, port, b"")
+                        break
+                        
+                    resp = await self._send_tcp_tunnel_action(session_id, "send", host, port, data)
+                    if not resp:
+                        errors += 1
+                        if errors > 3:
+                            break
+                    else:
+                        errors = 0
+                        
+                    if resp.get("closed"):
+                        writer.close()
+                        break
+            except Exception as e:
+                log.debug("TCP upload_task ended: %s", e)
+                
+        async def download_task():
+            errors = 0
+            try:
+                while True:
+                    resp = await self._send_tcp_tunnel_action(session_id, "poll", host, port, b"")
+                    if not resp:
+                        errors += 1
+                        if errors > 3:
+                            break
+                        await asyncio.sleep(1.0)  # Backoff on error
+                        continue
+                    else:
+                        errors = 0
+
+                    if resp.get("b"):
+                        writer.write(base64.b64decode(resp["b"]))
+                        await writer.drain()
+                    if resp.get("closed"):
+                        try:
+                            writer.write_eof()
+                        except Exception:
+                            writer.close()
+                        break
+            except Exception as e:
+                log.debug("TCP download_task ended: %s", e)
+                
+        t1 = asyncio.create_task(upload_task())
+        t2 = asyncio.create_task(download_task())
+        await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        t1.cancel()
+        t2.cancel()
+        return True
+
     # ── Apps Script relay (apps_script mode) ──────────────────────
 
     async def relay(self, method: str, url: str,
